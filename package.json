@@ -1,0 +1,35 @@
+{
+  "name": "save-bot",
+  "version": "1.0.0",
+  "description": "Telegram save bot for downloading media from social platforms",
+  "main": "src/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "dev": "nodemon src/index.js",
+    "start": "node src/index.js",
+    "lint": "echo \"No linter configured\""
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "instagram",
+    "facebook",
+    "youtube",
+    "downloader"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@ffmpeg-installer/ffmpeg": "^1.1.0",
+    "dotenv": "^16.6.1",
+    "mongoose": "^8.19.1",
+    "p-limit": "^3.1.0",
+    "telegraf": "^4.16.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
