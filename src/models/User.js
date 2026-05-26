@@ -12,9 +12,13 @@ const userSchema = new mongoose.Schema(
     phoneNumber: { type: String, default: null },
     phoneSharedAt: { type: Date, default: null },
     phoneShareMessageId: { type: Number, default: null },
-    chatId: { type: Number, default: null },
+    chatId: { type: Number, default: null, index: true },
+    isBlocked: { type: Boolean, default: false, index: true },
+    blockedAt: { type: Date, default: null },
+    blockedBy: { type: Number, default: null },
+    blockedReason: { type: String, default: null },
     rawFrom: { type: mongoose.Schema.Types.Mixed, default: null },
-    lastSeenAt: { type: Date, default: Date.now }
+    lastSeenAt: { type: Date, default: Date.now, index: true }
   },
   { timestamps: true }
 );

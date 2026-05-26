@@ -20,9 +20,15 @@ module.exports = {
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN,
   mongodbUri,
   maxFileSizeBytes: Number(process.env.MAX_FILE_SIZE_MB || 49) * 1024 * 1024,
-  downloadConcurrency: Number(process.env.DOWNLOAD_CONCURRENCY || 3),
+  downloadConcurrency: Number(process.env.DOWNLOAD_CONCURRENCY || 6),
   ytdlpBinary: process.env.YTDLP_BINARY || "yt-dlp",
   ffmpegBinary: process.env.FFMPEG_BINARY || null,
   ytJsRuntimes: process.env.YT_JS_RUNTIMES || "node",
-  requiredChannelUsername: process.env.REQUIRED_CHANNEL_USERNAME || null
+  requiredChannelUsername: process.env.REQUIRED_CHANNEL_USERNAME || null,
+  adminIds: (process.env.ADMIN_IDS || "")
+    .split(",")
+    .map((id) => Number(id.trim()))
+    .filter((id) => Number.isFinite(id) && id > 0),
+  broadcastConcurrency: Number(process.env.BROADCAST_CONCURRENCY || 28),
+  broadcastDelayMs: Number(process.env.BROADCAST_DELAY_MS || 35)
 };

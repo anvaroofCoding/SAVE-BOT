@@ -1,4 +1,5 @@
 const { execFile, spawn } = require("node:child_process");
+const { Readable } = require("node:stream");
 const fs = require("node:fs/promises");
 const { createWriteStream } = require("node:fs");
 const path = require("node:path");
@@ -6,6 +7,8 @@ const os = require("node:os");
 const { pipeline } = require("node:stream/promises");
 const { promisify } = require("node:util");
 const env = require("../config/env");
+const { detectPlatform, isInstagramCarouselCandidate } = require("../utils/url");
+const { resolveInstagramRacing } = require("./fastExtractors");
 
 const execFileAsync = promisify(execFile);
 
@@ -15,6 +18,9 @@ try {
 } catch (_) {
   bundledFfmpegPath = null;
 }
+
+const CURL_UA =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
 
 function detectMediaTypeFromExt(filePath) {
   const ext = path.extname(filePath).toLowerCase();
@@ -26,85 +32,115 @@ function detectMediaTypeFromExt(filePath) {
   return "document";
 }
 
-function detectPlatform(url) {
-  const lowerUrl = String(url || "").toLowerCase();
-
-  if (lowerUrl.includes("instagram.com")) {
-    return "instagram";
-  }
-
-  if (lowerUrl.includes("facebook.com") || lowerUrl.includes("fb.watch")) {
-    return "facebook";
-  }
-
-  if (lowerUrl.includes("youtube.com") || lowerUrl.includes("youtu.be")) {
-    return "youtube";
-  }
-
-  return "unknown";
-}
-
 async function createWorkDir() {
   const base = path.join(os.tmpdir(), "save-bot-");
   return fs.mkdtemp(base);
 }
 
-function buildYtDlpFormat(platform) {
+function buildYtDlpFormat(platform, fast = false) {
   if (platform === "youtube") {
+    if (fast) {
+      return "18/134/243/b[height<=360][ext=mp4]/b[height<=480][ext=mp4]/worst[ext=mp4]";
+    }
     return "best[height<=480][ext=mp4]/best[height<=720][ext=mp4]/best[ext=mp4]/best";
+  }
+
+  if (fast) {
+    return "b[height<=360][ext=mp4]/b[height<=480][ext=mp4]/worst[ext=mp4]/best";
   }
 
   return "b[height<=480][ext=mp4]/b[height<=720][ext=mp4]/b[ext=mp4]/best";
 }
 
-async function runYtDlp(url, outputDir, options = {}) {
-  const platform = options.platform || detectPlatform(url);
-  const outputTemplate = "%(title).80s-%(id)s.%(ext)s";
+function baseYtDlpArgs(platform, options = {}) {
   const ffmpegBinary = env.ffmpegBinary || bundledFfmpegPath;
   const ffmpegLocation = ffmpegBinary ? path.dirname(ffmpegBinary) : null;
-  const noPlaylist = options.noPlaylist !== false;
-
   const args = [
-    ...(noPlaylist ? ["--no-playlist"] : []),
-    "--newline",
+    ...(options.noPlaylist !== false ? ["--no-playlist"] : []),
+    "--no-warnings",
     "--force-ipv4",
     "--socket-timeout",
-    "15",
+    "10",
     "--retries",
-    "3",
+    "1",
     "--fragment-retries",
-    "3",
+    "1",
     "--js-runtimes",
     env.ytJsRuntimes,
-    "--merge-output-format",
-    "mp4",
-    "--format",
-    buildYtDlpFormat(platform),
-    "--print",
-    "after_move:filepath",
-    "-P",
-    outputDir,
-    "-o",
-    outputTemplate
+    "--no-mtime",
+    "--no-write-info-json",
+    "--no-write-thumbnail",
+    "--no-write-playlist-metafiles"
   ];
+
+  if (platform === "youtube") {
+    args.push("--extractor-args", "youtube:player_client=android,web");
+  }
 
   if (ffmpegLocation) {
     args.push("--ffmpeg-location", ffmpegLocation);
   }
 
-  args.push(url);
-
-  const lines = await runYtDlpWithProgress(args, {
-    onProgress: options.onProgress
-  });
-
-  const filePaths = [...new Set(lines.filter((line) => line.startsWith(outputDir)))];
-
-  if (!filePaths.length) {
-    throw new Error("Could not resolve downloaded file path from yt-dlp output");
+  if (options.format) {
+    args.push("--format", options.format);
+  } else if (!options.skipFormat) {
+    args.push("--format", buildYtDlpFormat(platform, options.fast));
   }
 
-  return filePaths;
+  return args;
+}
+
+function runYtDlpCapture(args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(env.ytdlpBinary, args, {
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+
+    const lines = [];
+    let stdoutBuffer = "";
+    let stderrBuffer = "";
+
+    function flushChunk(chunk, fromStdErr = false) {
+      const text = chunk.toString();
+      const combined = fromStdErr ? (stderrBuffer + text) : (stdoutBuffer + text);
+      const parts = combined.split(/\r?\n/);
+      const remainder = parts.pop() || "";
+
+      for (const rawLine of parts) {
+        const line = rawLine.trim();
+        if (!line) continue;
+
+        lines.push(line);
+        const progress = parseYtDlpProgressLine(line);
+        if (progress && typeof options.onProgress === "function") {
+          options.onProgress(progress);
+        }
+      }
+
+      if (fromStdErr) {
+        stderrBuffer = remainder;
+      } else {
+        stdoutBuffer = remainder;
+      }
+    }
+
+    child.stdout.on("data", (chunk) => flushChunk(chunk, false));
+    child.stderr.on("data", (chunk) => flushChunk(chunk, true));
+
+    child.on("error", reject);
+
+    child.on("close", (code) => {
+      const tailLines = [stdoutBuffer.trim(), stderrBuffer.trim()].filter(Boolean);
+      lines.push(...tailLines);
+
+      if (code !== 0) {
+        reject(new Error(`yt-dlp exited with code ${code}`));
+        return;
+      }
+
+      resolve(lines);
+    });
+  });
 }
 
 function parseEtaToSeconds(rawEta) {
@@ -152,59 +188,64 @@ function parseYtDlpProgressLine(line) {
   return { percent, etaSeconds, speed };
 }
 
-function runYtDlpWithProgress(args, options = {}) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(env.ytdlpBinary, args, {
-      stdio: ["ignore", "pipe", "pipe"]
-    });
+async function resolveYtDlpDirectUrl(url, platform) {
+  const args = [
+    ...baseYtDlpArgs(platform, { fast: true, skipFormat: false }),
+    "--skip-download",
+    "--print",
+    "url",
+    url
+  ];
 
-    const lines = [];
-    let stdoutBuffer = "";
-    let stderrBuffer = "";
+  const lines = await runYtDlpCapture(args);
+  const directUrl = lines.find((line) => line.startsWith("http"));
+  if (!directUrl) {
+    throw new Error("Direct media URL not found");
+  }
 
-    function flushChunk(chunk, fromStdErr = false) {
-      const text = chunk.toString();
-      const combined = fromStdErr ? (stderrBuffer + text) : (stdoutBuffer + text);
-      const parts = combined.split(/\r?\n/);
-      const remainder = parts.pop() || "";
+  return directUrl;
+}
 
-      for (const rawLine of parts) {
-        const line = rawLine.trim();
-        if (!line) continue;
+async function runYtDlp(url, outputDir, options = {}) {
+  const platform = options.platform || detectPlatform(url);
+  const outputTemplate = "%(title).80s-%(id)s.%(ext)s";
+  const isYoutubeFast = platform === "youtube" && options.fast !== false;
 
-        lines.push(line);
-        const progress = parseYtDlpProgressLine(line);
-        if (progress && typeof options.onProgress === "function") {
-          options.onProgress(progress);
-        }
-      }
+  const args = [
+    ...baseYtDlpArgs(platform, {
+      fast: options.fast,
+      noPlaylist: options.noPlaylist
+    }),
+    "--newline",
+    "--concurrent-fragments",
+    "8",
+    "--http-chunk-size",
+    "10M",
+    "--print",
+    "after_move:filepath",
+    "-P",
+    outputDir,
+    "-o",
+    outputTemplate
+  ];
 
-      if (fromStdErr) {
-        stderrBuffer = remainder;
-      } else {
-        stdoutBuffer = remainder;
-      }
-    }
+  if (!isYoutubeFast) {
+    args.push("--merge-output-format", "mp4");
+  }
 
-    child.stdout.on("data", (chunk) => flushChunk(chunk, false));
-    child.stderr.on("data", (chunk) => flushChunk(chunk, true));
+  args.push(url);
 
-    child.on("error", (error) => {
-      reject(error);
-    });
-
-    child.on("close", (code) => {
-      const tailLines = [stdoutBuffer.trim(), stderrBuffer.trim()].filter(Boolean);
-      lines.push(...tailLines);
-
-      if (code !== 0) {
-        reject(new Error(`yt-dlp exited with code ${code}`));
-        return;
-      }
-
-      resolve(lines);
-    });
+  const lines = await runYtDlpCapture(args, {
+    onProgress: options.onProgress
   });
+
+  const filePaths = [...new Set(lines.filter((line) => line.startsWith(outputDir)))];
+
+  if (!filePaths.length) {
+    throw new Error("Could not resolve downloaded file path from yt-dlp output");
+  }
+
+  return filePaths;
 }
 
 function decodeHtmlEntities(value) {
@@ -247,14 +288,26 @@ function resolveExtensionFromContentType(contentType, fallbackUrl) {
   return ext || ".bin";
 }
 
-async function downloadInstagramFallback(url, outputDir) {
-  const { stdout: html } = await execFileAsync(
-    "curl",
-    ["-sL", url],
-    {
-      maxBuffer: 10 * 1024 * 1024
-    }
-  );
+async function fetchInstagramHtml(url) {
+  const response = await fetch(url, {
+    headers: {
+      "user-agent": CURL_UA,
+      accept: "text/html,application/xhtml+xml",
+      "accept-language": "en-US,en;q=0.9"
+    },
+    redirect: "follow",
+    signal: AbortSignal.timeout(5000)
+  });
+
+  if (!response.ok) {
+    throw new Error(`Instagram page fetch failed with status ${response.status}`);
+  }
+
+  return response.text();
+}
+
+async function resolveInstagramFromHtml(url) {
+  const html = await fetchInstagramHtml(url);
 
   const videoUrl =
     extractMetaContent(html, "og:video:secure_url") ||
@@ -263,40 +316,48 @@ async function downloadInstagramFallback(url, outputDir) {
     extractMetaContent(html, "og:image") ||
     extractMetaContent(html, "og:image:url");
 
-  const fallbackUrl = videoUrl || imageUrl;
-  if (!fallbackUrl) throw new Error("Instagram media metadata not found in page HTML");
+  const directUrl = videoUrl || imageUrl;
+  if (!directUrl) {
+    throw new Error("Instagram media metadata not found in page HTML");
+  }
 
-  // Detect carousel: Instagram embeds carousel_media_count or thumbnail_resources in the page
   const isCarousel =
     html.includes('"carousel_media_count"') ||
     html.includes('"thumbnail_resources":[{') ||
     (html.match(/\d+ photos - /i) !== null);
 
-  const mediaResponse = await fetch(fallbackUrl, {
-    headers: {
-      referer: "https://www.instagram.com/",
-      "user-agent":
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
-    }
+  const mediaType = videoUrl ? "video" : "photo";
+
+  return { directUrl, mediaType, isCarousel };
+}
+
+const INSTAGRAM_FETCH_HEADERS = {
+  referer: "https://www.instagram.com/",
+  "user-agent": CURL_UA,
+  accept: "*/*"
+};
+
+async function downloadFromDirectUrl(directUrl, outputDir, mediaTypeHint) {
+  const mediaResponse = await fetch(directUrl, {
+    headers: INSTAGRAM_FETCH_HEADERS,
+    signal: AbortSignal.timeout(18_000)
   });
 
   if (!mediaResponse.ok || !mediaResponse.body) {
-    throw new Error(`Instagram media fetch failed with status ${mediaResponse.status}`);
+    throw new Error(`Media fetch failed with status ${mediaResponse.status}`);
   }
 
   const contentType = mediaResponse.headers.get("content-type") || "";
-  const extension = resolveExtensionFromContentType(
-    contentType,
-    fallbackUrl
-  );
-  const outputPath = path.join(outputDir, `instagram-fallback${extension}`);
+  const extension = resolveExtensionFromContentType(contentType, directUrl);
+  const outputPath = path.join(outputDir, `media${extension}`);
 
   await pipeline(mediaResponse.body, createWriteStream(outputPath));
 
   const mediaType =
-    videoUrl || contentType.includes("video") ? "video" : "photo";
+    mediaTypeHint ||
+    (contentType.includes("video") ? "video" : detectMediaTypeFromExt(outputPath));
 
-  return { filePath: outputPath, mediaType, isCarousel };
+  return { filePath: outputPath, mediaType };
 }
 
 function sortByName(a, b) {
@@ -319,6 +380,120 @@ async function mapFilesToMediaItems(filePaths) {
   return items.sort(sortByName);
 }
 
+function createYtDlpStdoutStream(url, platform) {
+  const isYoutubeFast = platform === "youtube";
+  const args = [
+    ...baseYtDlpArgs(platform, { fast: true, noPlaylist: true }),
+    "-o",
+    "-",
+    "--no-part",
+    "--hls-prefer-native"
+  ];
+
+  if (!isYoutubeFast) {
+    args.push("--merge-output-format", "mp4");
+  }
+
+  args.push(url);
+
+  const child = spawn(env.ytdlpBinary, args, {
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+
+  return {
+    stream: child.stdout,
+    child,
+    onStderr: (listener) => child.stderr.on("data", listener)
+  };
+}
+
+function waitForChildProcess(child) {
+  return new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(`yt-dlp stream exited with code ${code}`));
+    });
+  });
+}
+
+async function streamDirectMedia(directUrl, mediaTypeHint) {
+  const mediaResponse = await fetch(directUrl, {
+    headers: INSTAGRAM_FETCH_HEADERS,
+    signal: AbortSignal.timeout(12_000)
+  });
+
+  if (!mediaResponse.ok || !mediaResponse.body) {
+    throw new Error(`Media stream failed with status ${mediaResponse.status}`);
+  }
+
+  const contentType = mediaResponse.headers.get("content-type") || "";
+  const mediaType =
+    mediaTypeHint ||
+    (contentType.includes("video") ? "video" : "photo");
+
+  return {
+    stream: Readable.fromWeb(mediaResponse.body),
+    mediaType,
+    contentLength: Number(mediaResponse.headers.get("content-length")) || null
+  };
+}
+
+async function resolveMediaFast(url) {
+  const platform = detectPlatform(url);
+
+  if (platform === "youtube") {
+    return { mode: "download", platform };
+  }
+
+  if (platform === "instagram") {
+    try {
+      const meta = await resolveInstagramRacing(url);
+      return {
+        mode: "url",
+        platform,
+        directUrl: meta.directUrl,
+        mediaType: meta.mediaType,
+        prefetch: meta,
+        note: meta.isCarousel ? "Carousel postda birinchi media yuborildi." : null
+      };
+    } catch (_) {
+      return { mode: "download", platform };
+    }
+  }
+
+  if (platform === "facebook") {
+    return { mode: "download", platform };
+  }
+
+  return { mode: "download", platform };
+}
+
+async function downloadInstagramFast(url, workDir, options = {}) {
+  const meta = options.prefetch || await resolveInstagramFromHtml(url);
+  const downloaded = await downloadFromDirectUrl(
+    meta.directUrl,
+    workDir,
+    meta.mediaType
+  );
+  const stat = await fs.stat(downloaded.filePath);
+
+  return {
+    items: [
+      {
+        filePath: downloaded.filePath,
+        fileName: path.basename(downloaded.filePath),
+        mediaType: downloaded.mediaType,
+        fileSizeBytes: stat.size
+      }
+    ],
+    note: meta.isCarousel ? "Carousel postda birinchi media yuborildi." : null
+  };
+}
+
 async function downloadMedia(url, options = {}) {
   const workDir = await createWorkDir();
   const platform = detectPlatform(url);
@@ -328,44 +503,26 @@ async function downloadMedia(url, options = {}) {
     let note = null;
 
     if (platform === "instagram") {
-      const isReel = url.toLowerCase().includes("/reel/");
-      if (isReel) {
+      try {
+        const fast = await downloadInstagramFast(url, workDir, options);
+        mediaItems = fast.items;
+        note = fast.note;
+      } catch (_) {
         const reelPaths = await runYtDlp(url, workDir, {
           platform: "instagram",
-          noPlaylist: true,
+          fast: true,
+          noPlaylist: !isInstagramCarouselCandidate(url),
           onProgress: options.onProgress
         });
         mediaItems = await mapFilesToMediaItems(reelPaths);
-      } else {
-        try {
-          const postPaths = await runYtDlp(url, workDir, {
-            platform: "instagram",
-            noPlaylist: false,
-            onProgress: options.onProgress
-          });
-          mediaItems = await mapFilesToMediaItems(postPaths);
-          if (mediaItems.length > 1) {
-            note = `Carousel aniqlandi: ${mediaItems.length} ta media topildi.`;
-          }
-        } catch (_) {
-          const result = await downloadInstagramFallback(url, workDir);
-          const stat = await fs.stat(result.filePath);
-          mediaItems = [
-            {
-              filePath: result.filePath,
-              fileName: path.basename(result.filePath),
-              mediaType: result.mediaType,
-              fileSizeBytes: stat.size
-            }
-          ];
-          if (result.isCarousel) {
-            note = "Carousel postda barcha media olinmadi, birinchi media yuborildi.";
-          }
+        if (mediaItems.length > 1) {
+          note = `Carousel aniqlandi: ${mediaItems.length} ta media topildi.`;
         }
       }
     } else {
       const filePaths = await runYtDlp(url, workDir, {
         platform,
+        fast: true,
         noPlaylist: true,
         onProgress: options.onProgress
       });
@@ -399,17 +556,8 @@ async function downloadAudio(url, options = {}) {
   const ffmpegBinary = env.ffmpegBinary || bundledFfmpegPath;
   const ffmpegLocation = ffmpegBinary ? path.dirname(ffmpegBinary) : null;
   const args = [
-    "--no-playlist",
+    ...baseYtDlpArgs(detectPlatform(url), { fast: true }),
     "--newline",
-    "--force-ipv4",
-    "--socket-timeout",
-    "15",
-    "--retries",
-    "3",
-    "--fragment-retries",
-    "3",
-    "--js-runtimes",
-    env.ytJsRuntimes,
     "-x",
     "--audio-format",
     "mp3",
@@ -420,23 +568,21 @@ async function downloadAudio(url, options = {}) {
     "-P",
     workDir,
     "-o",
-    outputTemplate
+    outputTemplate,
+    url
   ];
 
   if (ffmpegLocation) {
     args.push("--ffmpeg-location", ffmpegLocation);
   }
 
-  args.push(url);
-
   try {
-    const lines = await runYtDlpWithProgress(args, {
+    const lines = await runYtDlpCapture(args, {
       onProgress: options.onProgress
     });
 
     let filePaths = [...new Set(lines.filter((line) => line.startsWith(workDir)))];
 
-    // Some yt-dlp/ffmpeg combinations do not print after_move path; fall back to scanning the work dir.
     if (!filePaths.length) {
       const entries = await fs.readdir(workDir);
       const audioExt = new Set([".mp3", ".m4a", ".aac", ".opus", ".wav", ".ogg", ".flac"]);
@@ -477,5 +623,9 @@ async function cleanupDownloadedFile(filePath, dirPath) {
 module.exports = {
   downloadMedia,
   downloadAudio,
+  resolveMediaFast,
+  streamDirectMedia,
+  createYtDlpStdoutStream,
+  waitForChildProcess,
   cleanupDownloadedFile
 };

@@ -6,10 +6,37 @@ const User = require("../models/User");
 const DownloadJob = require("../models/DownloadJob");
 const MediaCache = require("../models/MediaCache");
 const { extractUrls, detectPlatform } = require("../utils/url");
-const { downloadMedia, downloadAudio, cleanupDownloadedFile } = require("../services/downloader");
+const {
+  downloadMedia,
+  downloadAudio,
+  resolveMediaFast,
+  streamDirectMedia,
+  createYtDlpStdoutStream,
+  waitForChildProcess,
+  cleanupDownloadedFile
+} = require("../services/downloader");
+const {
+  getCachedMedia,
+  setCachedMedia,
+  getCachedSubscription,
+  setCachedSubscription
+} = require("../services/fastCache");
+const {
+  buildProgressMessage,
+  buildDoneMessage
+} = require("../utils/progressUi");
+const { isUserBlocked } = require("./admin");
 
 const queue = pLimit(env.downloadConcurrency);
 const requiredChannelUsername = (env.requiredChannelUsername || "").replace(/^@/, "") || null;
+const PROGRESS_TICK_MS = 2000;
+const PROGRESS_START_DELAY_MS = 4000;
+const PLATFORM_ETA_SECONDS = {
+  youtube: 10,
+  instagram: 6,
+  facebook: 12,
+  unknown: 10
+};
 
 function buildSubscriptionKeyboard() {
   if (!requiredChannelUsername) {
@@ -27,16 +54,19 @@ async function checkChannelSubscription(ctx) {
     return true;
   }
 
+  const cached = getCachedSubscription(ctx.from.id);
+  if (cached === true) {
+    return true;
+  }
+
   try {
     const chatId = `@${requiredChannelUsername}`;
-    const member = await ctx.telegram.getChatMember(
-      chatId,
-      ctx.from.id
-    );
+    const member = await ctx.telegram.getChatMember(chatId, ctx.from.id);
     const isSubscribed =
       ["member", "administrator", "creator"].includes(member.status) ||
       (member.status === "restricted" && member.is_member === true);
-    console.log(`[CHECK] User ${ctx.from.id} channel ${chatId}: status=${member.status}, subscribed=${isSubscribed}`);
+
+    setCachedSubscription(ctx.from.id, isSubscribed);
     return isSubscribed;
   } catch (error) {
     console.log(`[CHECK] Error checking subscription for user ${ctx.from.id}:`, error?.message);
@@ -75,7 +105,7 @@ async function withTelegramRetry(operation, attempts = 3) {
         throw error;
       }
 
-      await sleep(700 * (i + 1));
+      await sleep(400 * (i + 1));
     }
   }
 
@@ -106,7 +136,7 @@ function sendMediaGroup(ctx, mediaGroup) {
   return withTelegramRetry(() => ctx.replyWithMediaGroup(mediaGroup));
 }
 
-async function upsertUser(from, ctx, extra = {}) {
+function upsertUser(from, ctx, extra = {}) {
   if (!from) return;
 
   const update = {
@@ -123,11 +153,13 @@ async function upsertUser(from, ctx, extra = {}) {
     ...extra
   };
 
-  await User.findOneAndUpdate(
+  User.findOneAndUpdate(
     { telegramId: from.id },
     update,
     { upsert: true, new: true, setDefaultsOnInsert: true }
-  );
+  ).catch((error) => {
+    console.error("[USER] upsert failed:", error?.message);
+  });
 }
 
 async function ensureSubscriptionOrPrompt(ctx) {
@@ -144,24 +176,62 @@ async function ensureSubscriptionOrPrompt(ctx) {
   return false;
 }
 
+async function lookupMediaCache(sourceUrl) {
+  const memoryHit = getCachedMedia(sourceUrl);
+  if (memoryHit?.telegramFileId) {
+    return memoryHit;
+  }
+
+  const dbHit = await MediaCache.findOne({ sourceUrl }).lean();
+  if (dbHit?.telegramFileId) {
+    setCachedMedia(sourceUrl, dbHit);
+  }
+
+  return dbHit;
+}
+
+async function persistMediaCache(sourceUrl, payload) {
+  setCachedMedia(sourceUrl, payload);
+
+  MediaCache.findOneAndUpdate(
+    { sourceUrl },
+    {
+      sourceUrl,
+      platform: payload.platform,
+      title: payload.title || null,
+      mediaType: payload.mediaType,
+      telegramFileId: payload.telegramFileId,
+      fileSizeBytes: payload.fileSizeBytes || 0
+    },
+    { upsert: true, setDefaultsOnInsert: true }
+  ).catch((error) => {
+    console.error("[CACHE] persist failed:", error?.message);
+  });
+}
+
+function sendChatActionForMedia(ctx, mediaType) {
+  const action = mediaType === "photo" ? "upload_photo" : "upload_video";
+  return ctx.sendChatAction(action).catch(() => {});
+}
+
 async function sendFromCache(ctx, cached, audioKeyboard) {
   if (cached.mediaType === "photo") {
     await sendPhoto(ctx, cached.telegramFileId, {
-      caption: "⚡ Keshdan yuborildi"
+      caption: "⚡ Tayyor"
     });
     return;
   }
 
   if (cached.mediaType === "video") {
     await sendVideo(ctx, cached.telegramFileId, {
-      caption: "⚡ Keshdan yuborildi",
+      caption: "⚡ Tayyor",
       reply_markup: audioKeyboard
     });
     return;
   }
 
   await sendDocument(ctx, cached.telegramFileId, {
-    caption: "⚡ Keshdan yuborildi"
+    caption: "⚡ Tayyor"
   });
 }
 
@@ -175,6 +245,142 @@ function formatSeconds(seconds) {
   }
 
   return `${seconds} s`;
+}
+
+function createProgressTracker(ctx, prefix, options = {}) {
+  const fallbackEta = PLATFORM_ETA_SECONDS[options.platform] || PLATFORM_ETA_SECONDS.unknown;
+  const state = {
+    platform: options.platform || "unknown",
+    customTitle: options.customTitle || null,
+    prefix,
+    phase: "preparing",
+    percent: 5,
+    startedAt: Date.now(),
+    fallbackEta,
+    deadlineAt: Date.now() + fallbackEta * 1000,
+    shownRemaining: fallbackEta,
+    messageId: null,
+    timer: null
+  };
+
+  function syncDeadline(etaSeconds) {
+    if (!Number.isFinite(etaSeconds)) return;
+
+    const candidate = Date.now() + Math.max(0, Math.round(etaSeconds)) * 1000;
+    if (candidate < state.deadlineAt) {
+      state.deadlineAt = candidate;
+    }
+  }
+
+  function getRemainingSeconds() {
+    const raw = Math.max(0, Math.ceil((state.deadlineAt - Date.now()) / 1000));
+    if (raw < state.shownRemaining) {
+      state.shownRemaining = raw;
+    }
+    return state.shownRemaining;
+  }
+
+  function getEffectivePercent() {
+    if (state.phase === "uploading") {
+      return Math.max(state.percent || 0, 95);
+    }
+
+    if (Number.isFinite(state.percent) && state.percent > 0) {
+      return Math.min(94, state.percent);
+    }
+
+    const totalMs = state.fallbackEta * 1000;
+    const remainingMs = Math.max(0, state.deadlineAt - Date.now());
+    const doneRatio = 1 - remainingMs / totalMs;
+    return Math.min(90, Math.max(6, Math.round(doneRatio * 100)));
+  }
+
+  function render() {
+    return buildProgressMessage({
+      platform: state.platform,
+      customTitle: state.customTitle,
+      phase: state.phase,
+      percent: getEffectivePercent(),
+      prefix: state.prefix,
+      etaSeconds: getRemainingSeconds()
+    });
+  }
+
+  async function refresh() {
+    if (!state.messageId) return;
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      state.messageId,
+      undefined,
+      render()
+    ).catch(() => {});
+  }
+
+  return {
+    onProgress(progress) {
+      if (state.phase === "preparing") {
+        state.phase = "downloading";
+      }
+
+      syncDeadline(progress?.etaSeconds);
+
+      if (Number.isFinite(progress?.percent)) {
+        state.percent = Math.max(state.percent || 0, progress.percent);
+      }
+    },
+    setPhase(phase) {
+      state.phase = phase;
+      if (phase === "uploading") {
+        state.percent = Math.max(state.percent || 0, 95);
+        state.shownRemaining = Math.min(state.shownRemaining, 2);
+        state.deadlineAt = Math.min(state.deadlineAt, Date.now() + 2000);
+      }
+    },
+    async start() {
+      state.startTimeout = setTimeout(async () => {
+        const progressMsg = await sendText(ctx, render()).catch(() => null);
+        if (!progressMsg) return;
+
+        state.messageId = progressMsg.message_id;
+        state.timer = setInterval(() => {
+          refresh();
+        }, PROGRESS_TICK_MS);
+      }, PROGRESS_START_DELAY_MS);
+    },
+    async finish(doneText) {
+      if (state.startTimeout) {
+        clearTimeout(state.startTimeout);
+        state.startTimeout = null;
+      }
+      if (state.timer) {
+        clearInterval(state.timer);
+        state.timer = null;
+      }
+
+      if (!state.messageId) {
+        await sendText(ctx, doneText).catch(() => {});
+        return;
+      }
+
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        state.messageId,
+        undefined,
+        doneText
+      ).catch(() => {});
+    },
+    async stop() {
+      if (state.startTimeout) {
+        clearTimeout(state.startTimeout);
+        state.startTimeout = null;
+      }
+      if (state.timer) {
+        clearInterval(state.timer);
+        state.timer = null;
+      }
+    },
+    update: refresh
+  };
 }
 
 function buildAudioKeyboard(jobId, platform, mediaType) {
@@ -200,90 +406,395 @@ function getJobPrefix(index, total) {
   return `${index}/${total} `;
 }
 
+function extractTelegramFileId(message) {
+  return (
+    message?.photo?.[message.photo.length - 1]?.file_id ||
+    message?.video?.file_id ||
+    message?.document?.file_id ||
+    null
+  );
+}
+
+async function sendResolvedMedia(ctx, {
+  prefix,
+  sourceUrl,
+  platform,
+  mediaType,
+  directUrl,
+  caption,
+  audioKeyboard
+}) {
+  if (mediaType === "photo") {
+    return sendPhoto(ctx, directUrl, { caption });
+  }
+
+  if (mediaType === "video") {
+    return sendVideo(ctx, directUrl, {
+      caption,
+      supports_streaming: true,
+      reply_markup: audioKeyboard
+    });
+  }
+
+  return sendDocument(ctx, directUrl, { caption });
+}
+
+async function tryFastUrlDelivery(ctx, {
+  sourceUrl,
+  platform,
+  prefix,
+  jobId,
+  fastMeta
+}) {
+  const audioKeyboard = buildAudioKeyboard(jobId, platform, fastMeta.mediaType);
+  const caption = `${prefix}Mana, tayyor ✅`;
+
+  try {
+    const sent = await sendResolvedMedia(ctx, {
+      prefix,
+      sourceUrl,
+      platform,
+      mediaType: fastMeta.mediaType,
+      directUrl: fastMeta.directUrl,
+      caption,
+      audioKeyboard
+    });
+
+    const fileId = extractTelegramFileId(sent);
+    if (fileId) {
+      await persistMediaCache(sourceUrl, {
+        platform,
+        mediaType: fastMeta.mediaType,
+        telegramFileId: fileId,
+        fileSizeBytes: 0,
+        title: null
+      });
+    }
+
+    return { ok: true, fileId, mediaType: fastMeta.mediaType };
+  } catch (error) {
+    console.log(`[FAST] URL delivery failed for ${sourceUrl}:`, error?.message);
+    return { ok: false };
+  }
+}
+
+async function tryStreamDelivery(ctx, {
+  sourceUrl,
+  platform,
+  prefix,
+  jobId,
+  fastMeta,
+  progress
+}) {
+  if (!fastMeta?.directUrl || platform !== "instagram") {
+    return { ok: false };
+  }
+
+  try {
+    progress?.setPhase("downloading");
+    await progress?.update();
+
+    const streamed = await streamDirectMedia(fastMeta.directUrl, fastMeta.mediaType);
+
+    progress?.setPhase("uploading");
+    await progress?.update();
+
+    const audioKeyboard = buildAudioKeyboard(jobId, platform, streamed.mediaType);
+    const caption = `${prefix}Mana, tayyor ✅`;
+    const source = { source: streamed.stream };
+
+    let sent;
+    if (streamed.mediaType === "photo") {
+      sent = await sendPhoto(ctx, source, { caption });
+    } else {
+      sent = await sendVideo(ctx, source, {
+        caption,
+        supports_streaming: true,
+        reply_markup: audioKeyboard
+      });
+    }
+
+    const fileId = extractTelegramFileId(sent);
+    if (fileId) {
+      await persistMediaCache(sourceUrl, {
+        platform,
+        mediaType: streamed.mediaType,
+        telegramFileId: fileId,
+        fileSizeBytes: streamed.contentLength || 0,
+        title: null
+      });
+    }
+
+    await progress?.finish(buildDoneMessage({ platform, prefix }));
+
+    return { ok: true, fileId, mediaType: streamed.mediaType };
+  } catch (error) {
+    console.log(`[STREAM] delivery failed for ${sourceUrl}:`, error?.message);
+    return { ok: false };
+  }
+}
+
+async function tryYtDlpPipeDelivery(ctx, {
+  sourceUrl,
+  platform,
+  prefix,
+  jobId,
+  progress
+}) {
+  if (!["youtube", "instagram", "facebook"].includes(platform)) {
+    return { ok: false };
+  }
+
+  const { stream, child, onStderr } = createYtDlpStdoutStream(sourceUrl, platform);
+
+  try {
+    if (progress) {
+      progress.setPhase("downloading");
+      onStderr((chunk) => {
+        const line = chunk.toString();
+        const percentMatch = line.match(/(\d+(?:\.\d+)?)%/);
+        const etaMatch = line.match(/ETA\s+([0-9:]+)/i);
+        if (percentMatch) {
+          progress.onProgress({ percent: Number(percentMatch[1]) });
+        }
+        if (etaMatch) {
+          const parts = etaMatch[1].split(":").map(Number);
+          let etaSeconds = 0;
+          if (parts.length === 3) {
+            etaSeconds = (parts[0] * 3600) + (parts[1] * 60) + parts[2];
+          } else if (parts.length === 2) {
+            etaSeconds = (parts[0] * 60) + parts[1];
+          } else {
+            etaSeconds = parts[0];
+          }
+          progress.onProgress({ etaSeconds });
+        }
+      });
+      await progress.update();
+    }
+
+    const audioKeyboard = buildAudioKeyboard(jobId, platform, "video");
+    const caption = `${prefix}Mana, tayyor ✅`;
+
+    progress?.setPhase("uploading");
+    await progress?.update();
+
+    const sent = await sendVideo(ctx, { source: stream }, {
+      caption,
+      supports_streaming: true,
+      reply_markup: audioKeyboard
+    });
+
+    await waitForChildProcess(child);
+
+    const fileId = extractTelegramFileId(sent);
+    if (fileId) {
+      await persistMediaCache(sourceUrl, {
+        platform,
+        mediaType: "video",
+        telegramFileId: fileId,
+        fileSizeBytes: 0,
+        title: null
+      });
+    }
+
+    await progress?.finish(buildDoneMessage({ platform, prefix }));
+
+    return { ok: true, fileId, mediaType: "video" };
+  } catch (error) {
+    child.kill("SIGKILL");
+    console.log(`[PIPE] yt-dlp stream failed for ${sourceUrl}:`, error?.message);
+    return { ok: false };
+  }
+}
+
+async function deliverMediaFast(ctx, {
+  sourceUrl,
+  platform,
+  prefix,
+  jobId,
+  fastMeta,
+  progress
+}) {
+  if (fastMeta?.directUrl) {
+    if (platform !== "instagram" && platform !== "youtube") {
+      const urlResult = await tryFastUrlDelivery(ctx, {
+        sourceUrl,
+        platform,
+        prefix,
+        jobId,
+        fastMeta
+      });
+      if (urlResult.ok) return urlResult;
+    }
+
+    const streamResult = await tryStreamDelivery(ctx, {
+      sourceUrl,
+      platform,
+      prefix,
+      jobId,
+      fastMeta,
+      progress
+    });
+    if (streamResult.ok) return streamResult;
+  }
+
+  const pipeResult = await tryYtDlpPipeDelivery(ctx, {
+    sourceUrl,
+    platform,
+    prefix,
+    jobId,
+    progress
+  });
+  if (pipeResult.ok) return pipeResult;
+
+  return { ok: false };
+}
+
+async function sendDownloadedMedia(ctx, {
+  downloaded,
+  platform,
+  prefix,
+  jobId,
+  elapsedDisplay
+}) {
+  const primaryItem = downloaded.mediaItems?.[0] || {
+    filePath: downloaded.filePath,
+    mediaType: downloaded.mediaType,
+    fileSizeBytes: downloaded.fileSizeBytes
+  };
+
+  const sizeKb = Math.round(downloaded.fileSizeBytes / 1024);
+  const sizeDisplay = sizeKb >= 1024
+    ? `${(sizeKb / 1024).toFixed(1)} MB`
+    : `${sizeKb} KB`;
+  const doneCaption = `${prefix}Mana, tayyor ✅ | 📦 ${sizeDisplay}`
+    + (downloaded.note ? `\n\nℹ️ ${downloaded.note}` : "");
+
+  const multiItems = downloaded.mediaItems || [];
+  const canSendAlbum =
+    multiItems.length > 1 &&
+    platform === "instagram" &&
+    multiItems.every((item) => item.mediaType === "photo" || item.mediaType === "video");
+
+  if (canSendAlbum) {
+    const mediaGroup = multiItems.slice(0, 10).map((item, index) => {
+      const media = { source: fs.createReadStream(item.filePath) };
+      const entry = { type: item.mediaType, media };
+      if (index === 0) {
+        entry.caption = doneCaption;
+      }
+      return entry;
+    });
+
+    const sentGroup = await sendMediaGroup(ctx, mediaGroup);
+    return { message: sentGroup[0], primaryItem };
+  }
+
+  const source = { source: fs.createReadStream(primaryItem.filePath) };
+  const audioKeyboard = buildAudioKeyboard(jobId, platform, primaryItem.mediaType);
+
+  if (primaryItem.mediaType === "photo") {
+    const message = await sendPhoto(ctx, source, { caption: doneCaption });
+    return { message, primaryItem };
+  }
+
+  if (primaryItem.mediaType === "video") {
+    const message = await sendVideo(ctx, source, {
+      caption: doneCaption,
+      supports_streaming: true,
+      reply_markup: audioKeyboard
+    });
+    return { message, primaryItem };
+  }
+
+  const message = await sendDocument(ctx, source, { caption: doneCaption });
+  return { message, primaryItem };
+}
+
 async function processLink(ctx, sourceUrl, meta = {}) {
   const platform = detectPlatform(sourceUrl);
   const prefix = getJobPrefix(meta.index, meta.total);
   let job;
   let downloaded;
+  const startedAt = Date.now();
+
+  const jobPromise = DownloadJob.create({
+    telegramId: ctx.from.id,
+    chatId: ctx.chat.id,
+    sourceUrl,
+    platform,
+    status: "queued"
+  }).catch((error) => {
+    console.error("[JOB] create failed:", error?.message);
+    return null;
+  });
 
   try {
-    job = await DownloadJob.create({
-      telegramId: ctx.from.id,
-      chatId: ctx.chat.id,
-      sourceUrl,
-      platform,
-      status: "queued"
-    });
+    const chatAction = sendChatActionForMedia(ctx, "video");
+    const [cached, resolvedJob, fastMeta] = await Promise.all([
+      lookupMediaCache(sourceUrl),
+      jobPromise,
+      resolveMediaFast(sourceUrl),
+      chatAction
+    ]);
 
-    const useCache = platform !== "instagram";
-    const cached = useCache ? await MediaCache.findOne({ sourceUrl }).lean() : null;
-    const cachedAudioKeyboard = buildAudioKeyboard(job?._id, platform, cached?.mediaType);
+    job = resolvedJob;
+
     if (cached?.telegramFileId) {
-      await sendFromCache(ctx, cached, cachedAudioKeyboard);
-      await DownloadJob.findByIdAndUpdate(job._id, {
-        status: "done",
-        mediaType: cached.mediaType,
-        telegramFileId: cached.telegramFileId,
-        title: cached.title,
-        fileSizeBytes: cached.fileSizeBytes,
-        processedAt: new Date()
-      });
+      const audioKeyboard = buildAudioKeyboard(job?._id, platform, cached.mediaType);
+      await sendFromCache(ctx, cached, audioKeyboard);
+
+      if (job?._id) {
+        DownloadJob.findByIdAndUpdate(job._id, {
+          status: "done",
+          mediaType: cached.mediaType,
+          telegramFileId: cached.telegramFileId,
+          title: cached.title,
+          fileSizeBytes: cached.fileSizeBytes,
+          processedAt: new Date()
+        }).catch(() => {});
+      }
       return;
     }
 
-    await DownloadJob.findByIdAndUpdate(job._id, { status: "processing" });
-
-    const downloadStart = Date.now();
-    const progressState = {
-      etaSeconds: null,
-      etaUpdatedAt: 0,
-      percent: null
-    };
-    const progressMsg = await sendText(ctx, `${prefix}Yuklab olinmoqda... ⏳ ETA kutilmoqda`);
-
-    const progressTimer = setInterval(async () => {
-      const elapsed = Math.floor((Date.now() - downloadStart) / 1000);
-      const etaDisplay = progressState.etaSeconds === null
-        ? `ETA kutilmoqda | o'tdi ${formatSeconds(elapsed)}`
-        : `${formatSeconds(Math.max(0, progressState.etaSeconds - Math.floor((Date.now() - progressState.etaUpdatedAt) / 1000)))} qoldi`;
-      const percentDisplay = Number.isFinite(progressState.percent)
-        ? ` (${progressState.percent.toFixed(1)}%)`
-        : "";
-      await ctx.telegram.editMessageText(
-        ctx.chat.id,
-        progressMsg.message_id,
-        undefined,
-        `${prefix}Yuklab olinmoqda... ⏳ ${etaDisplay}${percentDisplay}`
-      ).catch(() => {});
-    }, 5000);
-
-    try {
-      downloaded = await downloadMedia(sourceUrl, {
-        onProgress: (progress) => {
-          if (Number.isFinite(progress?.etaSeconds)) {
-            progressState.etaSeconds = Math.max(0, Math.round(progress.etaSeconds));
-            progressState.etaUpdatedAt = Date.now();
-          }
-          if (Number.isFinite(progress?.percent)) {
-            progressState.percent = progress.percent;
-          }
-        }
-      });
-    } finally {
-      clearInterval(progressTimer);
+    if (job?._id) {
+      DownloadJob.findByIdAndUpdate(job._id, { status: "processing" }).catch(() => {});
     }
 
-    const elapsedTotal = Math.floor((Date.now() - downloadStart) / 1000);
-    const elapsedDisplay = elapsedTotal >= 60
-      ? `${Math.floor(elapsedTotal / 60)} min ${elapsedTotal % 60} s`
-      : `${elapsedTotal} s`;
+    const progress = createProgressTracker(ctx, prefix, { platform });
+    await progress.start();
 
-    await ctx.telegram.editMessageText(
-      ctx.chat.id,
-      progressMsg.message_id,
-      undefined,
-      `${prefix}Yuklandi ✅ (${elapsedDisplay})`
-    ).catch(() => {});
+    const fastResult = await deliverMediaFast(ctx, {
+      sourceUrl,
+      platform,
+      prefix,
+      jobId: job?._id,
+      fastMeta,
+      progress
+    });
+
+    if (fastResult.ok) {
+      if (job?._id) {
+        DownloadJob.findByIdAndUpdate(job._id, {
+          status: "done",
+          mediaType: fastResult.mediaType,
+          telegramFileId: fastResult.fileId,
+          processedAt: new Date()
+        }).catch(() => {});
+      }
+      return;
+    }
+
+    const downloadStart = Date.now();
+
+    downloaded = await downloadMedia(sourceUrl, {
+      prefetch: fastMeta.prefetch,
+      onProgress: (payload) => progress.onProgress(payload)
+    });
+
+    const elapsedTotal = Math.floor((Date.now() - downloadStart) / 1000);
+    const elapsedDisplay = formatSeconds(elapsedTotal);
 
     if (downloaded.fileSizeBytes > env.maxFileSizeBytes) {
       const sizeMb = (downloaded.fileSizeBytes / 1024 / 1024).toFixed(1);
@@ -291,100 +802,55 @@ async function processLink(ctx, sourceUrl, meta = {}) {
       throw new Error(`FILE_TOO_LARGE:${sizeMb}:${limitMb}`);
     }
 
-    const primaryItem = downloaded.mediaItems?.[0] || {
-      filePath: downloaded.filePath,
-      mediaType: downloaded.mediaType,
-      fileSizeBytes: downloaded.fileSizeBytes
-    };
-    const source = { source: fs.createReadStream(primaryItem.filePath) };
-    let sent;
+    progress.setPhase("uploading");
+    await progress.update();
 
-    const sizeKb = Math.round(downloaded.fileSizeBytes / 1024);
-    const sizeDisplay = sizeKb >= 1024
-      ? `${(sizeKb / 1024).toFixed(1)} MB`
-      : `${sizeKb} KB`;
-    const doneCaption = `${prefix}Mana, tayyor ✅\n⏱ ${elapsedDisplay} | 📦 ${sizeDisplay}`
-      + (downloaded.note ? `\n\nℹ️ ${downloaded.note}` : "");
-
-    const multiItems = downloaded.mediaItems || [];
-    const canSendAlbum =
-      multiItems.length > 1 &&
-      platform === "instagram" &&
-      multiItems.every((item) => item.mediaType === "photo" || item.mediaType === "video");
-
-    if (canSendAlbum) {
-      const mediaGroup = multiItems.slice(0, 10).map((item, index) => {
-        const media = { source: fs.createReadStream(item.filePath) };
-        const entry = {
-          type: item.mediaType,
-          media
-        };
-
-        if (index === 0) {
-          entry.caption = doneCaption;
-        }
-
-        return entry;
-      });
-
-      const sentGroup = await sendMediaGroup(ctx, mediaGroup);
-      sent = sentGroup[0];
-    } else if (primaryItem.mediaType === "photo") {
-      sent = await sendPhoto(ctx, source, {
-        caption: doneCaption
-      });
-    } else if (primaryItem.mediaType === "video") {
-      const audioKeyboard = buildAudioKeyboard(job?._id, platform, primaryItem.mediaType);
-      sent = await sendVideo(ctx, source, {
-        caption: doneCaption,
-        supports_streaming: true,
-        reply_markup: audioKeyboard
-      });
-    } else {
-      sent = await sendDocument(ctx, source, {
-        caption: doneCaption
-      });
-    }
-
-    const message = sent;
-    const fileId =
-      message.photo?.[message.photo.length - 1]?.file_id ||
-      message.video?.file_id ||
-      message.document?.file_id ||
-      null;
-
-    await DownloadJob.findByIdAndUpdate(job._id, {
-      status: "done",
-      mediaType: primaryItem.mediaType,
-      telegramFileId: fileId,
-      fileSizeBytes: downloaded.fileSizeBytes,
-      title: downloaded.fileName,
-      processedAt: new Date()
+    const { message, primaryItem } = await sendDownloadedMedia(ctx, {
+      downloaded,
+      platform,
+      prefix,
+      jobId: job?._id,
+      elapsedDisplay
     });
 
-    if (fileId && useCache) {
-      await MediaCache.findOneAndUpdate(
-        { sourceUrl },
-        {
-          sourceUrl,
-          platform,
-          title: downloaded.fileName,
-          mediaType: primaryItem.mediaType,
-          telegramFileId: fileId,
-          fileSizeBytes: downloaded.fileSizeBytes
-        },
-        { upsert: true, setDefaultsOnInsert: true }
-      );
+    await progress.finish(buildDoneMessage({ platform, prefix }));
+    await progress.stop();
+
+    const fileId = extractTelegramFileId(message);
+
+    if (job?._id) {
+      DownloadJob.findByIdAndUpdate(job._id, {
+        status: "done",
+        mediaType: primaryItem.mediaType,
+        telegramFileId: fileId,
+        fileSizeBytes: downloaded.fileSizeBytes,
+        title: downloaded.fileName,
+        processedAt: new Date()
+      }).catch(() => {});
+    }
+
+    if (fileId) {
+      await persistMediaCache(sourceUrl, {
+        platform,
+        mediaType: primaryItem.mediaType,
+        telegramFileId: fileId,
+        fileSizeBytes: downloaded.fileSizeBytes,
+        title: downloaded.fileName
+      });
     }
   } catch (error) {
     const err = error instanceof Error ? error.message : "Unknown download error";
 
+    if (!job) {
+      job = await jobPromise;
+    }
+
     if (job?._id) {
-      await DownloadJob.findByIdAndUpdate(job._id, {
+      DownloadJob.findByIdAndUpdate(job._id, {
         status: "failed",
         errorMessage: err,
         processedAt: new Date()
-      });
+      }).catch(() => {});
     }
 
     if (err.startsWith("FILE_TOO_LARGE:")) {
@@ -399,18 +865,23 @@ async function processLink(ctx, sourceUrl, meta = {}) {
     if (err.includes("nodename nor servname") || err.includes("Failed to resolve")) {
       await sendText(
         ctx,
-        `${prefix}🌐 Tarmoq xatosi: video serverga ulanish bo'lmadi. Iltimos 10-20 soniyadan keyin qayta urinib ko'ring.`
+        `${prefix}🌐 Tarmoq xatosi. 10-20 soniyadan keyin qayta urinib ko'ring.`
       );
       return;
     }
 
     await sendText(
       ctx,
-      `${prefix}Yuklab olishda xatolik bo'ldi. Linkni tekshirib qayta urinib ko'ring yoki boshqa link yuboring.`
+      `${prefix}Yuklab olishda xatolik. Linkni tekshirib qayta urinib ko'ring.`
     );
   } finally {
     if (downloaded?.filePath || downloaded?.cleanupDir) {
       await cleanupDownloadedFile(downloaded.filePath, downloaded.cleanupDir);
+    }
+
+    const totalMs = Date.now() - startedAt;
+    if (totalMs > 5000) {
+      console.log(`[SLOW] ${sourceUrl} took ${totalMs}ms`);
     }
   }
 }
@@ -436,46 +907,21 @@ async function processAudioRequest(ctx, jobId) {
     }
 
     await ctx.answerCbQuery("Audio tayyorlanmoqda...");
+    await ctx.sendChatAction("upload_voice").catch(() => {});
 
     const startedAt = Date.now();
-    const progressState = {
-      etaSeconds: null,
-      etaUpdatedAt: 0,
-      percent: null
-    };
-    const progressMsg = await sendText(ctx, "🎵 Audio ajratilmoqda... ⏳ ETA kutilmoqda");
-
-    const progressTimer = setInterval(async () => {
-      const elapsed = Math.floor((Date.now() - startedAt) / 1000);
-      const etaDisplay = progressState.etaSeconds === null
-        ? `ETA kutilmoqda | o'tdi ${formatSeconds(elapsed)}`
-        : `${formatSeconds(Math.max(0, progressState.etaSeconds - Math.floor((Date.now() - progressState.etaUpdatedAt) / 1000)))} qoldi`;
-      const percentDisplay = Number.isFinite(progressState.percent)
-        ? ` (${progressState.percent.toFixed(1)}%)`
-        : "";
-
-      await ctx.telegram.editMessageText(
-        ctx.chat.id,
-        progressMsg.message_id,
-        undefined,
-        `🎵 Audio ajratilmoqda... ⏳ ${etaDisplay}${percentDisplay}`
-      ).catch(() => {});
-    }, 5000);
+    const progress = createProgressTracker(ctx, "", {
+      platform: job.platform,
+      customTitle: "Audio"
+    });
+    await progress.start();
 
     try {
       downloaded = await downloadAudio(job.sourceUrl, {
-        onProgress: (progress) => {
-          if (Number.isFinite(progress?.etaSeconds)) {
-            progressState.etaSeconds = Math.max(0, Math.round(progress.etaSeconds));
-            progressState.etaUpdatedAt = Date.now();
-          }
-          if (Number.isFinite(progress?.percent)) {
-            progressState.percent = progress.percent;
-          }
-        }
+        onProgress: (payload) => progress.onProgress(payload)
       });
     } finally {
-      clearInterval(progressTimer);
+      await progress.stop();
     }
 
     if (downloaded.fileSizeBytes > env.maxFileSizeBytes) {
@@ -485,29 +931,34 @@ async function processAudioRequest(ctx, jobId) {
       return;
     }
 
+    progress.setPhase("uploading");
+    await progress.update();
+
     const elapsed = Math.floor((Date.now() - startedAt) / 1000);
-    await ctx.telegram.editMessageText(
-      ctx.chat.id,
-      progressMsg.message_id,
-      undefined,
-      `🎵 Audio tayyor ✅ (${formatSeconds(elapsed)})`
-    ).catch(() => {});
+    const elapsedDisplay = formatSeconds(elapsed);
 
     const source = { source: fs.createReadStream(downloaded.filePath) };
     await sendAudio(ctx, source, {
-      caption: `🎵 Audio tayyor\n⏱ ${formatSeconds(elapsed)}`,
+      caption: `🎵 Audio tayyor\n⏱ ${elapsedDisplay}`,
       title: downloaded.fileName
     });
+
+    await progress.finish(
+      buildDoneMessage({
+        platform: job.platform,
+        customTitle: "Audio"
+      })
+    );
   } catch (error) {
     const err = error instanceof Error ? error.message : "Unknown audio error";
     console.error("[AUDIO] Failed to extract audio:", err);
 
     if (err.toLowerCase().includes("ffmpeg")) {
-      await sendText(ctx, "Audio ajratishda ffmpeg xatoligi bo'ldi. Server sozlamasini tekshirib qayta urinib ko'ring.");
+      await sendText(ctx, "Audio ajratishda ffmpeg xatoligi bo'ldi.");
       return;
     }
 
-    await sendText(ctx, "Audio ajratishda xatolik bo'ldi. Linkni tekshirib qayta urinib ko'ring.");
+    await sendText(ctx, "Audio ajratishda xatolik bo'ldi.");
   } finally {
     if (downloaded?.filePath || downloaded?.cleanupDir) {
       await cleanupDownloadedFile(downloaded.filePath, downloaded.cleanupDir);
@@ -515,21 +966,31 @@ async function processAudioRequest(ctx, jobId) {
   }
 }
 
+async function ensureNotBlocked(ctx) {
+  if (await isUserBlocked(ctx.from.id)) {
+    await sendText(ctx, "🚫 Siz botdan bloklangansiz. Admin bilan bog'laning.");
+    return false;
+  }
+  return true;
+}
+
 function registerHandlers(bot) {
   bot.start(async (ctx) => {
-    await upsertUser(ctx.from, ctx);
+    upsertUser(ctx.from, ctx);
+
+    if (!(await ensureNotBlocked(ctx))) {
+      return;
+    }
 
     const canUseBot = await ensureSubscriptionOrPrompt(ctx);
     if (!canUseBot) {
       return;
     }
 
+    await sendText(ctx, "👋 Salom, xush kelibsiz!");
     await sendText(
       ctx,
-      "👋 Salom, xush kelibsiz!");
-    await sendText(
-      ctx,
-      "🤖 Men Save Botman.\n\n📌 Platformalar: Instagram, Facebook, YouTube\n📥 Link yuboring, media yuklab beraman\n🖼 Foto bo'lsa foto, 🎬 video bo'lsa video yuboraman\n⚡ Bir nechta link bo'lsa navbat bilan ishlayman\n\n🚀 Boshlash uchun link yuboring."
+      "🤖 Men Save Botman.\n\n📌 Instagram, Facebook, YouTube\n📥 Link yuboring — media tezda chiqadi\n⚡ Bir xil link qayta yuborilsa, darhol javob beraman\n\n🚀 Boshlash uchun link yuboring."
     );
   });
 
@@ -552,12 +1013,16 @@ function registerHandlers(bot) {
   bot.command("help", async (ctx) => {
     await sendText(
       ctx,
-      "🛟 Yordam\n\n1. Link yuboring\n2. Bot yuklab oladi\n3. Natijani yuboradi\n\n✅ Qo'llab-quvvatlanadi: Instagram, Facebook, YouTube"
+      "🛟 Yordam\n\n1. Link yuboring\n2. Bot media yuboradi\n\n✅ Instagram, Facebook, YouTube"
     );
   });
 
   bot.on("text", async (ctx) => {
-    await upsertUser(ctx.from, ctx);
+    upsertUser(ctx.from, ctx);
+
+    if (!(await ensureNotBlocked(ctx))) {
+      return;
+    }
 
     const canUseBot = await ensureSubscriptionOrPrompt(ctx);
     if (!canUseBot) {
@@ -570,18 +1035,12 @@ function registerHandlers(bot) {
       return;
     }
 
-    if (sourceUrls.length === 1) {
-      await sendText(ctx, "Link qabul qilindi. Navbatga qo'shildi.");
-    } else {
-      await sendText(ctx, `${sourceUrls.length} ta link qabul qilindi. Hammasi navbatga qo'shildi.`);
-    }
-
     sourceUrls.forEach((sourceUrl, index) => {
       queue(() => processLink(ctx, sourceUrl, { index: index + 1, total: sourceUrls.length })).catch(
         async () => {
           await sendText(
             ctx,
-            `${getJobPrefix(index + 1, sourceUrls.length)}Ichki navbat xatoligi yuz berdi. Iltimos, qayta urinib ko'ring.`
+            `${getJobPrefix(index + 1, sourceUrls.length)}Ichki xatolik. Qayta urinib ko'ring.`
           );
         }
       );
@@ -596,7 +1055,7 @@ function registerHandlers(bot) {
     }
 
     queue(() => processAudioRequest(ctx, jobId)).catch(async () => {
-      await sendText(ctx, "Audio so'rovini bajarishda ichki xatolik yuz berdi.");
+      await sendText(ctx, "Audio so'rovida ichki xatolik yuz berdi.");
     });
   });
 }
