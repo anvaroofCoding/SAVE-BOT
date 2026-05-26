@@ -3,7 +3,7 @@
 ## Tayyorlik checklist
 
 - [x] Bot kodi tayyor (`src/`)
-- [x] MongoDB (Atlas yoki server MongoDB)
+- [x] JSON ma'lumotlar (`data/data.json` avtomatik yaratiladi)
 - [x] `.env` serverda (gitga yuklanmaydi)
 - [ ] Serverda `yt-dlp` o'rnatilgan
 - [ ] Serverda `ffmpeg` o'rnatilgan (audio uchun)
@@ -61,7 +61,6 @@ Majburiy:
 
 ```env
 TELEGRAM_BOT_TOKEN=...
-MONGODB_URI=mongodb+srv://...
 NODE_ENV=production
 ADMIN_IDS=5079701692
 YTDLP_BINARY=/usr/local/bin/yt-dlp
@@ -70,6 +69,8 @@ DOWNLOAD_CONCURRENCY=4
 BROADCAST_CONCURRENCY=28
 BROADCAST_DELAY_MS=35
 ```
+
+Ma'lumotlar `data/data.json` faylida saqlanadi (backup qiling).
 
 ## 5. Ishga tushirish (PM2)
 
@@ -112,4 +113,4 @@ yt-dlp --version
 pm2 logs save-bot --lines 100
 ```
 
-MongoDB ulanmagan bo'lsa `MONGODB_URI` ni tekshiring (IP whitelist Atlas da: `0.0.0.0/0` yoki server IP).
+Ma'lumotlar yo'qolmasligi uchun `data/data.json` faylini muntazam backup qiling.

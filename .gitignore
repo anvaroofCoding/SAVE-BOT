@@ -1,5 +1,9 @@
 node_modules
 .env
+data/data.json
+data/*.json
+data/.bot.lock
+!data/.gitkeep
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

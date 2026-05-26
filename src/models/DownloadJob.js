@@ -1,26 +1,58 @@
-const mongoose = require("mongoose");
+const { updateDb, readDb, generateId } = require("../db/jsonStore");
 
-const downloadJobSchema = new mongoose.Schema(
-  {
-    telegramId: { type: Number, required: true, index: true },
-    chatId: { type: Number, required: true, index: true },
-    sourceUrl: { type: String, required: true },
-    platform: { type: String, default: "unknown" },
-    status: {
-      type: String,
-      enum: ["queued", "processing", "done", "failed"],
-      default: "queued"
-    },
-    title: { type: String, default: null },
-    mediaType: { type: String, enum: ["video", "photo", "document"], default: "document" },
-    fileSizeBytes: { type: Number, default: 0 },
-    telegramFileId: { type: String, default: null },
-    errorMessage: { type: String, default: null },
-    processedAt: { type: Date, default: null }
+function nowIso() {
+  return new Date().toISOString();
+}
+
+const DownloadJob = {
+  async create(payload) {
+    return updateDb((db) => {
+      const job = {
+        _id: generateId(),
+        telegramId: payload.telegramId,
+        chatId: payload.chatId,
+        sourceUrl: payload.sourceUrl,
+        platform: payload.platform || "unknown",
+        status: payload.status || "queued",
+        title: payload.title || null,
+        mediaType: payload.mediaType || "document",
+        fileSizeBytes: payload.fileSizeBytes || 0,
+        telegramFileId: payload.telegramFileId || null,
+        errorMessage: payload.errorMessage || null,
+        processedAt: payload.processedAt || null,
+        createdAt: nowIso(),
+        updatedAt: nowIso()
+      };
+
+      db.downloadJobs.push(job);
+      return job;
+    });
   },
-  { timestamps: true }
-);
 
-downloadJobSchema.index({ sourceUrl: 1, status: 1 });
+  findById(id) {
+    return {
+      async lean() {
+        const db = await readDb();
+        const job = db.downloadJobs.find((item) => item._id === id);
+        return job ? { ...job } : null;
+      }
+    };
+  },
 
-module.exports = mongoose.model("DownloadJob", downloadJobSchema);
+  async findByIdAndUpdate(id, update) {
+    return updateDb((db) => {
+      const index = db.downloadJobs.findIndex((item) => item._id === id);
+      if (index === -1) return null;
+
+      db.downloadJobs[index] = {
+        ...db.downloadJobs[index],
+        ...update,
+        updatedAt: nowIso()
+      };
+
+      return { ...db.downloadJobs[index] };
+    });
+  }
+};
+
+module.exports = DownloadJob;

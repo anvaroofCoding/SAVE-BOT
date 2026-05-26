@@ -4,7 +4,17 @@ const env = require("../config/env");
 const CURL_UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
 
-const EXTRACT_TIMEOUT_MS = 5500;
+const FAST_TIMEOUT_MS = 2200;
+const BACKUP_TIMEOUT_MS = 4500;
+
+function withTimeout(promise, ms, label = "timeout") {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error(`${label} after ${ms}ms`)), ms);
+    })
+  ]);
+}
 
 function decodeHtmlEntities(value) {
   return value
@@ -40,7 +50,32 @@ function extractMetaContent(html, property) {
   return null;
 }
 
-function extractVideoFromHtml(html) {
+function extractSmallestVideoFromHtml(html) {
+  const versions = [];
+  const blockMatch = html.match(/"video_versions"\s*:\s*(\[[\s\S]*?\])\s*,/i);
+
+  if (blockMatch?.[1]) {
+    try {
+      const normalized = blockMatch[1].replace(/\\\//g, "/");
+      const parsed = JSON.parse(normalized);
+      for (const item of parsed) {
+        if (!item?.url) continue;
+        versions.push({
+          url: unescapeJsonUrl(item.url),
+          width: Number(item.width) || 9999,
+          height: Number(item.height) || 9999
+        });
+      }
+    } catch {
+      // ignore malformed json
+    }
+  }
+
+  if (versions.length) {
+    versions.sort((a, b) => (a.width * a.height) - (b.width * b.height));
+    return { directUrl: versions[0].url, mediaType: "video" };
+  }
+
   const videoUrl =
     extractMetaContent(html, "og:video:secure_url") ||
     extractMetaContent(html, "og:video");
@@ -59,8 +94,7 @@ function extractVideoFromHtml(html) {
   const jsonPatterns = [
     /"video_url":"([^"]+)"/i,
     /"playback_url":"([^"]+)"/i,
-    /"contentUrl":"([^"]+)"/i,
-    /"src":"(https:\\\/\\\/[^"]+\.mp4[^"]*)"/i
+    /"contentUrl":"([^"]+)"/i
   ];
 
   for (const pattern of jsonPatterns) {
@@ -76,19 +110,20 @@ function extractVideoFromHtml(html) {
   return null;
 }
 
-async function fetchText(url, timeoutMs = EXTRACT_TIMEOUT_MS) {
+async function fetchText(url, timeoutMs = FAST_TIMEOUT_MS) {
   const response = await fetch(url, {
     headers: {
       "user-agent": CURL_UA,
       accept: "text/html,application/xhtml+xml,application/json",
-      "accept-language": "en-US,en;q=0.9"
+      "accept-language": "en-US,en;q=0.9",
+      "cache-control": "no-cache"
     },
     redirect: "follow",
     signal: AbortSignal.timeout(timeoutMs)
   });
 
   if (!response.ok) {
-    throw new Error(`Fetch failed (${response.status}) for ${url}`);
+    throw new Error(`Fetch failed (${response.status})`);
   }
 
   return response.text();
@@ -97,12 +132,12 @@ async function fetchText(url, timeoutMs = EXTRACT_TIMEOUT_MS) {
 function getInstagramEmbedUrl(url) {
   const match = String(url).match(/\/(reel|reels|p|tv)\/([^/?#]+)/i);
   if (!match) return null;
-  return `https://www.instagram.com/p/${match[2]}/embed/captioned/`;
+  return `https://www.instagram.com/reel/${match[2]}/embed/`;
 }
 
 async function resolveFromHtml(url) {
-  const html = await fetchText(url);
-  const media = extractVideoFromHtml(html);
+  const html = await fetchText(url, FAST_TIMEOUT_MS);
+  const media = extractSmallestVideoFromHtml(html);
   if (!media) {
     throw new Error("No media in HTML");
   }
@@ -139,7 +174,7 @@ async function resolveViaSaveig(url) {
       referer: "https://saveig.app/"
     },
     body,
-    signal: AbortSignal.timeout(EXTRACT_TIMEOUT_MS)
+    signal: AbortSignal.timeout(BACKUP_TIMEOUT_MS)
   });
 
   if (!response.ok) {
@@ -148,69 +183,13 @@ async function resolveViaSaveig(url) {
 
   const payload = await response.json();
   const html = String(payload?.data || payload?.html || "");
-  const media = extractVideoFromHtml(html);
+  const media = extractSmallestVideoFromHtml(html);
 
   if (!media) {
-    const hrefMatch = html.match(/href="(https:\/\/[^"]+)"/i);
-    if (!hrefMatch) {
-      throw new Error("saveig returned no media");
-    }
-    return {
-      directUrl: hrefMatch[1],
-      mediaType: "video",
-      source: "saveig"
-    };
+    throw new Error("saveig returned no media");
   }
 
   return { ...media, source: "saveig" };
-}
-
-async function resolveViaCobalt(url) {
-  const endpoints = [
-    "https://api.cobalt.tools/api/json",
-    "https://co.wuk.sh/api/json"
-  ];
-
-  let lastError;
-
-  for (const endpoint of endpoints) {
-    try {
-      const response = await fetch(endpoint, {
-        method: "POST",
-        headers: {
-          accept: "application/json",
-          "content-type": "application/json"
-        },
-        body: JSON.stringify({
-          url,
-          downloadMode: "auto",
-          videoQuality: "480"
-        }),
-        signal: AbortSignal.timeout(EXTRACT_TIMEOUT_MS)
-      });
-
-      if (!response.ok) {
-        throw new Error(`cobalt ${response.status}`);
-      }
-
-      const data = await response.json();
-      const directUrl = data?.url || data?.picker?.[0]?.url;
-
-      if (!directUrl) {
-        throw new Error("cobalt returned no url");
-      }
-
-      return {
-        directUrl,
-        mediaType: "video",
-        source: "cobalt"
-      };
-    } catch (error) {
-      lastError = error;
-    }
-  }
-
-  throw lastError || new Error("cobalt unavailable");
 }
 
 function runYtDlpUrlOnly(url) {
@@ -220,9 +199,9 @@ function runYtDlpUrlOnly(url) {
       "--no-warnings",
       "--force-ipv4",
       "--socket-timeout",
-      "8",
+      "6",
       "--format",
-      "b[ext=mp4][filesize<8M]/b[height<=480]/worst[ext=mp4]/worst",
+      "b[ext=mp4][height<=360]/b[ext=mp4][filesize<6M]/b[height<=480]/worst[ext=mp4]",
       "--print",
       "url",
       "--skip-download",
@@ -271,33 +250,25 @@ function runYtDlpUrlOnly(url) {
 }
 
 async function resolveInstagramRacing(url) {
-  const extractors = [
-    () => resolveFromEmbed(url),
-    () => resolveFromHtml(url),
-    () => resolveViaSaveig(url),
-    () => resolveViaCobalt(url),
-    () => runYtDlpUrlOnly(url)
+  const fastTier = [
+    () => withTimeout(resolveFromEmbed(url), FAST_TIMEOUT_MS, "embed"),
+    () => withTimeout(resolveFromHtml(url), FAST_TIMEOUT_MS, "html")
   ];
 
-  const results = await Promise.allSettled(
-    extractors.map((extract) => extract())
-  );
+  const backupTier = [
+    () => withTimeout(resolveViaSaveig(url), BACKUP_TIMEOUT_MS, "saveig"),
+    () => withTimeout(runYtDlpUrlOnly(url), BACKUP_TIMEOUT_MS, "ytdlp-url")
+  ];
 
-  const winner = results.find((result) => result.status === "fulfilled");
-  if (winner) {
-    return winner.value;
+  try {
+    return await Promise.any(fastTier.map((run) => run()));
+  } catch {
+    return Promise.any(backupTier.map((run) => run()));
   }
-
-  const reasons = results
-    .filter((result) => result.status === "rejected")
-    .map((result) => result.reason?.message || "unknown")
-    .join(" | ");
-
-  throw new Error(`All extractors failed: ${reasons}`);
 }
 
 module.exports = {
   resolveInstagramRacing,
-  extractVideoFromHtml,
+  extractSmallestVideoFromHtml,
   fetchText
 };

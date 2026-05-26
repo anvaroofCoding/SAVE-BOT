@@ -31,9 +31,10 @@ const queue = pLimit(env.downloadConcurrency);
 const requiredChannelUsername = (env.requiredChannelUsername || "").replace(/^@/, "") || null;
 const PROGRESS_TICK_MS = 2000;
 const PROGRESS_START_DELAY_MS = 4000;
+const INSTAGRAM_PROGRESS_DELAY_MS = 0;
 const PLATFORM_ETA_SECONDS = {
   youtube: 10,
-  instagram: 6,
+  instagram: 5,
   facebook: 12,
   unknown: 10
 };
@@ -249,6 +250,9 @@ function formatSeconds(seconds) {
 
 function createProgressTracker(ctx, prefix, options = {}) {
   const fallbackEta = PLATFORM_ETA_SECONDS[options.platform] || PLATFORM_ETA_SECONDS.unknown;
+  const startDelayMs = options.platform === "instagram"
+    ? INSTAGRAM_PROGRESS_DELAY_MS
+    : PROGRESS_START_DELAY_MS;
   const state = {
     platform: options.platform || "unknown",
     customTitle: options.customTitle || null,
@@ -345,7 +349,7 @@ function createProgressTracker(ctx, prefix, options = {}) {
         state.timer = setInterval(() => {
           refresh();
         }, PROGRESS_TICK_MS);
-      }, PROGRESS_START_DELAY_MS);
+      }, startDelayMs);
     },
     async finish(doneText) {
       if (state.startTimeout) {
@@ -616,27 +620,40 @@ async function deliverMediaFast(ctx, {
   fastMeta,
   progress
 }) {
-  if (fastMeta?.directUrl) {
-    if (platform !== "instagram" && platform !== "youtube") {
-      const urlResult = await tryFastUrlDelivery(ctx, {
+  if (platform === "instagram") {
+    if (fastMeta?.directUrl) {
+      const streamResult = await tryStreamDelivery(ctx, {
         sourceUrl,
         platform,
         prefix,
         jobId,
-        fastMeta
+        fastMeta,
+        progress
       });
-      if (urlResult.ok) return urlResult;
+      if (streamResult.ok) return streamResult;
     }
 
-    const streamResult = await tryStreamDelivery(ctx, {
+    const pipeResult = await tryYtDlpPipeDelivery(ctx, {
       sourceUrl,
       platform,
       prefix,
       jobId,
-      fastMeta,
       progress
     });
-    if (streamResult.ok) return streamResult;
+    if (pipeResult.ok) return pipeResult;
+
+    return { ok: false };
+  }
+
+  if (fastMeta?.directUrl && platform !== "youtube") {
+    const urlResult = await tryFastUrlDelivery(ctx, {
+      sourceUrl,
+      platform,
+      prefix,
+      jobId,
+      fastMeta
+    });
+    if (urlResult.ok) return urlResult;
   }
 
   const pipeResult = await tryYtDlpPipeDelivery(ctx, {
@@ -763,6 +780,11 @@ async function processLink(ctx, sourceUrl, meta = {}) {
     }
 
     const progress = createProgressTracker(ctx, prefix, { platform });
+
+    if (platform === "instagram") {
+      await ctx.sendChatAction("upload_video").catch(() => {});
+    }
+
     await progress.start();
 
     const fastResult = await deliverMediaFast(ctx, {

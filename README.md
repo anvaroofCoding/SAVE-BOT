@@ -1,4 +1,4 @@
-# Save Bot (Telegram + Node.js + MongoDB)
+# Save Bot (Telegram + Node.js + JSON)
 
 This bot accepts social media links and returns downloadable media files in Telegram.
 
@@ -6,14 +6,13 @@ This bot accepts social media links and returns downloadable media files in Tele
 
 - Works with many platforms supported by `yt-dlp` (YouTube, Instagram, Facebook, and others)
 - Automatic media type detection (photo, video, document)
-- MongoDB logging for users and download jobs
+- JSON file storage for users, jobs, cache, and ads (`data/data.json`)
 - Cache by source URL to return already processed files faster
 - Download concurrency control
 
 ## Requirements
 
 - Node.js 20+
-- MongoDB 6+
 - `yt-dlp` installed on server
 - `ffmpeg` installed on server
 
@@ -40,7 +39,7 @@ cp .env.example .env
 3. Fill `.env` values:
 
 - `TELEGRAM_BOT_TOKEN` your bot token (recommended: regenerate token in BotFather first)
-- `MONGODB_URI` your MongoDB connection string
+- `ADMIN_IDS` your Telegram user id(s)
 
 4. Start development:
 
@@ -63,7 +62,8 @@ If your token was shared publicly, regenerate it in BotFather using `/revoke`.
 - `src/index.js` app entrypoint
 - `src/bot/handlers.js` Telegram handlers and main flow
 - `src/services/downloader.js` yt-dlp integration and file lifecycle
-- `src/models` MongoDB schemas
+- `src/models` JSON-backed data access
+- `data/data.json` local database file (auto-created)
 - `src/utils/url.js` URL extraction and platform detection
 
 ## Behavior

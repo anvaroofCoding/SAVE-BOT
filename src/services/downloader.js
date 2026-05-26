@@ -214,7 +214,8 @@ async function runYtDlp(url, outputDir, options = {}) {
   const args = [
     ...baseYtDlpArgs(platform, {
       fast: options.fast,
-      noPlaylist: options.noPlaylist
+      noPlaylist: options.noPlaylist,
+      format: options.format
     }),
     "--newline",
     "--concurrent-fragments",
@@ -229,7 +230,7 @@ async function runYtDlp(url, outputDir, options = {}) {
     outputTemplate
   ];
 
-  if (!isYoutubeFast) {
+  if (!isYoutubeFast && platform !== "instagram") {
     args.push("--merge-output-format", "mp4");
   }
 
@@ -382,15 +383,25 @@ async function mapFilesToMediaItems(filePaths) {
 
 function createYtDlpStdoutStream(url, platform) {
   const isYoutubeFast = platform === "youtube";
+  const isInstagram = platform === "instagram";
   const args = [
     ...baseYtDlpArgs(platform, { fast: true, noPlaylist: true }),
     "-o",
     "-",
     "--no-part",
-    "--hls-prefer-native"
+    "--hls-prefer-native",
+    "--retries",
+    "1"
   ];
 
-  if (!isYoutubeFast) {
+  if (isInstagram) {
+    args.push(
+      "--format",
+      "b[ext=mp4][height<=360]/b[ext=mp4][filesize<6M]/b[height<=480]/worst[ext=mp4]/worst",
+      "--extractor-args",
+      "instagram:api=web"
+    );
+  } else if (!isYoutubeFast) {
     args.push("--merge-output-format", "mp4");
   }
 
@@ -423,7 +434,7 @@ function waitForChildProcess(child) {
 async function streamDirectMedia(directUrl, mediaTypeHint) {
   const mediaResponse = await fetch(directUrl, {
     headers: INSTAGRAM_FETCH_HEADERS,
-    signal: AbortSignal.timeout(12_000)
+    signal: AbortSignal.timeout(45_000)
   });
 
   if (!mediaResponse.ok || !mediaResponse.body) {
@@ -511,7 +522,8 @@ async function downloadMedia(url, options = {}) {
         const reelPaths = await runYtDlp(url, workDir, {
           platform: "instagram",
           fast: true,
-          noPlaylist: !isInstagramCarouselCandidate(url),
+          noPlaylist: true,
+          format: "b[ext=mp4][height<=360]/b[height<=480]/worst[ext=mp4]/worst",
           onProgress: options.onProgress
         });
         mediaItems = await mapFilesToMediaItems(reelPaths);

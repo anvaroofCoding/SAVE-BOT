@@ -5,7 +5,9 @@
   "main": "src/index.js",
   "type": "commonjs",
   "scripts": {
-    "dev": "nodemon src/index.js",
+    "dev": "node src/index.js",
+    "dev:watch": "node --watch-path=./src --watch-preserve-output ./src/index.js",
+    "stop": "node scripts/stop-bot.js",
     "start": "node src/index.js",
     "start:prod": "NODE_ENV=production node src/index.js",
     "pm2:start": "pm2 start ecosystem.config.cjs",
@@ -26,7 +28,6 @@
   "dependencies": {
     "@ffmpeg-installer/ffmpeg": "^1.1.0",
     "dotenv": "^16.6.1",
-    "mongoose": "^8.19.1",
     "p-limit": "^3.1.0",
     "telegraf": "^4.16.3"
   },

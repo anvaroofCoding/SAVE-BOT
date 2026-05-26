@@ -1,15 +1,52 @@
-const mongoose = require("mongoose");
+const { updateDb, readDb, generateId } = require("../db/jsonStore");
 
-const mediaCacheSchema = new mongoose.Schema(
-  {
-    sourceUrl: { type: String, required: true, unique: true, index: true },
-    platform: { type: String, default: "unknown" },
-    title: { type: String, default: null },
-    mediaType: { type: String, enum: ["video", "photo", "document"], required: true },
-    telegramFileId: { type: String, required: true },
-    fileSizeBytes: { type: Number, default: 0 }
+function nowIso() {
+  return new Date().toISOString();
+}
+
+const MediaCache = {
+  findOne(query) {
+    return {
+      async lean() {
+        const db = await readDb();
+        const item = db.mediaCache.find((entry) => entry.sourceUrl === query.sourceUrl);
+        return item ? { ...item } : null;
+      }
+    };
   },
-  { timestamps: true }
-);
 
-module.exports = mongoose.model("MediaCache", mediaCacheSchema);
+  async findOneAndUpdate(filter, update, options = {}) {
+    return updateDb((db) => {
+      const index = db.mediaCache.findIndex((entry) => entry.sourceUrl === filter.sourceUrl);
+      const payload = {
+        sourceUrl: filter.sourceUrl,
+        platform: update.platform || "unknown",
+        title: update.title || null,
+        mediaType: update.mediaType,
+        telegramFileId: update.telegramFileId,
+        fileSizeBytes: update.fileSizeBytes || 0,
+        updatedAt: nowIso()
+      };
+
+      if (index === -1) {
+        if (!options.upsert) return null;
+        const created = {
+          _id: generateId(),
+          ...payload,
+          createdAt: nowIso()
+        };
+        db.mediaCache.push(created);
+        return created;
+      }
+
+      db.mediaCache[index] = {
+        ...db.mediaCache[index],
+        ...payload
+      };
+
+      return { ...db.mediaCache[index] };
+    });
+  }
+};
+
+module.exports = MediaCache;
